@@ -1,12 +1,9 @@
 """
-Scope Audio Transcription Control Plugin
-Real-time speech-to-text that controls Scope video generation parameters
+Scope Audio Transcription Plugin
+Real-time speech-to-text control for Daydream Scope video generation.
 
 Author: Krista Faist
-Based on Mirror's Echo installation
+Based on The Mirror's Echo installation.
 """
 
-from .plugin import AudioTranscriptionPlugin
-
-__version__ = "0.1.0"
-__all__ = ["AudioTranscriptionPlugin"]
+__version__ = "0.2.0"
