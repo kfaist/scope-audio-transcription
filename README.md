@@ -91,7 +91,7 @@ This plugin is based on **The Mirror's Echo** interactive installation by Krista
 
 ## 📝 License
 
-MIT License - Copyright (c) 2026 Krista Faist
+AGPL-3.0 WITH DUAL LICENSE FOR COMMERCIAL - Copyright (c) 2026 Krista Faist
 
 ## 🔗 Links
 
