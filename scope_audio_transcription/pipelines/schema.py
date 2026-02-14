@@ -31,13 +31,10 @@ class AudioTranscriptionConfig(BasePipelineConfig):
     # No prompts from the user — we generate them from speech
     supports_prompts = False
 
-    # Text mode (no video input required) — generates output from audio
-    modes = {
-        "text": ModeDefaults(default=True),
-        "video": ModeDefaults(input_size=1),
-    }
+    # Video mode only — preprocessor requires video input
+    modes = {"video": ModeDefaults(default=True)}
 
-    # Can also be used as a preprocessor for other pipelines
+    # Preprocessor: transforms input before main pipeline
     usage = [UsageType.PREPROCESSOR]
 
     # No heavy model downloads required by Scope (Whisper downloads on first use)
@@ -47,7 +44,7 @@ class AudioTranscriptionConfig(BasePipelineConfig):
     # --- Load-time parameters (set before streaming starts) ---
 
     model_size: str = Field(
-        default="base.en",
+        default="small.en",
         description="Whisper model size. Larger = more accurate but slower.",
         json_schema_extra=ui_field_config(
             order=1,
@@ -97,5 +94,14 @@ class AudioTranscriptionConfig(BasePipelineConfig):
         json_schema_extra=ui_field_config(
             order=5,
             label="Audio Chunk Duration",
+        ),
+    )
+
+    active_prompt: str = Field(
+        default="(waiting for voice...)",
+        description="Currently active prompt being sent to the generator.",
+        json_schema_extra=ui_field_config(
+            order=6,
+            label="Active Prompt",
         ),
     )

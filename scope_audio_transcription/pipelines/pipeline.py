@@ -134,17 +134,19 @@ class AudioTranscriptionPipeline(Pipeline):
 
     def __call__(self, **kwargs) -> dict:
         video_input = kwargs.get("video")
-        if video_input is None:
-            raise ValueError("No video input")
+        output = {}
 
-        # Pass video through — single frame, minimal processing
-        frame = video_input[0] if isinstance(video_input, list) else video_input
-        if frame.dim() == 4:
-            frame = frame.squeeze(0)
-        # frame should be (H, W, C) uint8 from Scope
-        # Convert to (1, H, W, C) float [0,1] for output
-        frames = frame.unsqueeze(0).to(device=self.device, dtype=torch.float32) / 255.0
-        output = {"video": frames.clamp(0, 1)}
+        # Pass video through for our own output queue (preprocessor must output video)
+        if video_input is not None:
+            frame = video_input[0] if isinstance(video_input, list) else video_input
+            if frame.dim() == 4:
+                frame = frame.squeeze(0)
+            frames = frame.unsqueeze(0).to(device=self.device, dtype=torch.float32) / 255.0
+            output["video"] = frames.clamp(0, 1)
+
+        # Tell downstream StreamDiffusion to ignore video and use text-only mode
+        # pipeline_processor sets _video_mode=False, so video won't be passed to SD
+        output["input_mode"] = "text"
 
         # Slow down to match downstream consumption (~1fps)
         time.sleep(0.9)
@@ -153,6 +155,11 @@ class AudioTranscriptionPipeline(Pipeline):
         # Otherwise the UI typed prompt passes through untouched
         if self._last_injected and (time.monotonic() - self._last_inject_time < 10.0):
             output["prompts"] = [{"text": self._last_injected, "weight": 100.0}]
+        elif self._last_injected and (time.monotonic() - self._last_inject_time >= 10.0):
+            # Voice prompt expired — clear it and reset cache so UI prompt takes over
+            logger.info("AUDIO-PLUGIN: voice prompt expired, reverting to UI prompt")
+            self._last_injected = ""
+            output["reset_cache"] = True
 
         # Only process audio every N seconds
         now = time.monotonic()
@@ -221,10 +228,11 @@ class AudioTranscriptionPipeline(Pipeline):
         if noun_prompt == self._last_injected:
             return output
 
-        # Update persistent prompt
+        # Update persistent prompt and reset cache so SD regenerates from new prompt
         self._last_injected = noun_prompt
         self._last_inject_time = time.monotonic()
         output["prompts"] = [{"text": noun_prompt, "weight": 100.0}]
+        output["reset_cache"] = True
         logger.info(f"AUDIO-PLUGIN: >>> NEW PROMPT: '{noun_prompt}' (from: '{text}')")
         return output
 
