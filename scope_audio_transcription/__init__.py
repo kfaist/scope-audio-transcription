@@ -1,9 +1,9 @@
 """
 Scope Audio Transcription Plugin
-Real-time speech-to-text control for Daydream Scope video generation.
+Voice-controlled AI video generation for Daydream Scope.
 
 Author: Krista Faist
-Based on The Mirror's Echo installation.
+Based on The Mirror's Echo interactive installation.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

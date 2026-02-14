@@ -1,11 +1,15 @@
 """Audio Transcription pipeline for Daydream Scope.
 
 Captures microphone audio, transcribes with Whisper AI,
-and injects transcriptions directly as prompts.
+extracts concrete nouns via NLP, and injects them as prompts.
 
-IMPORTANT: As a preprocessor, we must pass video through but NOT flood
-the output queue. We return video on every call (Scope needs it) but
-the framework's throttler + output queue handle backpressure.
+Voice prompts persist until replaced by new voice nouns
+or until user submits a new prompt from the UI prompt box.
+Cache resets on every prompt change for clean transitions.
+
+Forces StreamDiffusion into text-only generation mode via
+input_mode parameter, so prompts control output fully
+even with video input selected in UI.
 
 Author: Krista Faist
 """
@@ -52,6 +56,8 @@ class AudioTranscriptionPipeline(Pipeline):
         self._last_text = ""
         self._last_injected = ""
         self._last_inject_time = 0.0
+        self._last_ui_prompt = ""
+        self._ui_prompt_initialized = False  # First UI prompt is just startup, don't clear voice
 
         # Timing - process audio every 5 seconds
         self._last_process_time = 0.0
@@ -130,7 +136,10 @@ class AudioTranscriptionPipeline(Pipeline):
             logger.error(f"AUDIO-PLUGIN: mic start failed: {e}")
 
     def prepare(self, **kwargs) -> Requirements:
-        return Requirements(input_size=1)
+        # Only request video if video mode is active
+        if kwargs.get("video") is not None:
+            return Requirements(input_size=1)
+        return None
 
     def __call__(self, **kwargs) -> dict:
         video_input = kwargs.get("video")
@@ -145,21 +154,33 @@ class AudioTranscriptionPipeline(Pipeline):
             output["video"] = frames.clamp(0, 1)
 
         # Tell downstream StreamDiffusion to ignore video and use text-only mode
-        # pipeline_processor sets _video_mode=False, so video won't be passed to SD
+        # pipeline_processor bypass sets _video_mode=False directly
         output["input_mode"] = "text"
 
         # Slow down to match downstream consumption (~1fps)
-        time.sleep(0.9)
+        time.sleep(0.3)
 
-        # Re-inject last voice prompt if we have one and it's recent (10s timeout)
-        # Otherwise the UI typed prompt passes through untouched
-        if self._last_injected and (time.monotonic() - self._last_inject_time < 10.0):
+        # Check if user submitted a new UI prompt (overrides voice)
+        ui_prompts = kwargs.get("prompts")
+        if ui_prompts and isinstance(ui_prompts, list) and len(ui_prompts) > 0:
+            ui_text = ui_prompts[0].get("text", "") if isinstance(ui_prompts[0], dict) else str(ui_prompts[0])
+            if ui_text:
+                if not self._ui_prompt_initialized:
+                    # First time seeing a UI prompt — just record it, don't clear voice
+                    self._last_ui_prompt = ui_text
+                    self._ui_prompt_initialized = True
+                    logger.info(f"AUDIO-PLUGIN: initial UI prompt recorded: '{ui_text}'")
+                elif ui_text != self._last_ui_prompt:
+                    # User actually changed the prompt — clear voice, use theirs
+                    logger.info(f"AUDIO-PLUGIN: UI prompt changed to '{ui_text}', clearing voice")
+                    self._last_ui_prompt = ui_text
+                    self._last_injected = ""
+                    output["reset_cache"] = True
+                    return output
+
+        # Keep injecting last voice prompt indefinitely until replaced
+        if self._last_injected:
             output["prompts"] = [{"text": self._last_injected, "weight": 100.0}]
-        elif self._last_injected and (time.monotonic() - self._last_inject_time >= 10.0):
-            # Voice prompt expired — clear it and reset cache so UI prompt takes over
-            logger.info("AUDIO-PLUGIN: voice prompt expired, reverting to UI prompt")
-            self._last_injected = ""
-            output["reset_cache"] = True
 
         # Only process audio every N seconds
         now = time.monotonic()
@@ -179,7 +200,7 @@ class AudioTranscriptionPipeline(Pipeline):
 
         logger.info("AUDIO-PLUGIN: transcribing...")
         audio_float = audio.astype(np.float32) / 32768.0
-        # Resample from native rate (44100) to 16000 for Whisper
+        # Resample from native rate (48000) to 16000 for Whisper
         if self._native_rate != self.sample_rate:
             ratio = self.sample_rate / self._native_rate
             new_len = int(len(audio_float) * ratio)
@@ -188,10 +209,10 @@ class AudioTranscriptionPipeline(Pipeline):
             audio_float = audio_float[indices_floor]
         max_amp = np.max(np.abs(audio_float))
         logger.info(f"AUDIO-PLUGIN: audio amplitude={max_amp:.4f}")
-        if max_amp < 0.02:
+        if max_amp < 0.008:
             return output
         segments, info = self._whisper_model.transcribe(
-            audio_float, language="en", beam_size=1, vad_filter=True
+            audio_float, language="en", beam_size=1, vad_filter=False
         )
         text = " ".join(seg.text.strip() for seg in segments).strip()
         logger.info(f"AUDIO-PLUGIN: result='{text}'")
@@ -218,7 +239,7 @@ class AudioTranscriptionPipeline(Pipeline):
             nouns = [text]
 
         if not nouns:
-            logger.info(f"AUDIO-PLUGIN: no nouns found in '{text}', falling back to UI prompt")
+            logger.info(f"AUDIO-PLUGIN: no nouns found in '{text}', skipping")
             return output
 
         # Build prompt from nouns only
@@ -228,7 +249,7 @@ class AudioTranscriptionPipeline(Pipeline):
         if noun_prompt == self._last_injected:
             return output
 
-        # Update persistent prompt and reset cache so SD regenerates from new prompt
+        # New voice prompt — inject with cache reset for clean transition
         self._last_injected = noun_prompt
         self._last_inject_time = time.monotonic()
         output["prompts"] = [{"text": noun_prompt, "weight": 100.0}]

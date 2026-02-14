@@ -1,21 +1,20 @@
 [project]
 name = "scope-audio-transcription"
-version = "0.2.0"
-description = "Real-time audio transcription plugin for Daydream Scope - voice-controlled AI video generation"
+version = "0.3.0"
+description = "Voice-controlled AI video generation plugin for Daydream Scope — speak and watch imagery transform in real time"
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 authors = [
     {name = "Krista Faist", email = "kristabluedoor@gmail.com"},
 ]
 urls = {Homepage = "https://github.com/kfaist/scope-audio-transcription"}
 
 dependencies = [
-    "openai-whisper",
-    "nltk",
+    "faster-whisper",
     "spacy",
-    "soundfile",
     "sounddevice",
+    "numpy",
 ]
 
 [project.entry-points."scope"]
