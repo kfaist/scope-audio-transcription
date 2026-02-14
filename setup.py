@@ -7,7 +7,7 @@ setup(
     author_email="kristabluedoor@gmail.com",
     description="Real-time audio transcription plugin for Daydream Scope",
     url="https://github.com/kfaist/scope-audio-transcription",
-    py_modules=["plugin"],
+    packages=["scope_audio_transcription"],
     python_requires=">=3.9",
     install_requires=[
         "openai-whisper",
@@ -16,8 +16,8 @@ setup(
         "soundfile",
     ],
     entry_points={
-        "daydream.scope.plugins": [
-            "audio-transcription = plugin:create_plugin",
+        "scope": [
+            "audio-transcription = scope_audio_transcription.plugin:create_plugin",
         ],
     },
 )
