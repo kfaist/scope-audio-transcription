@@ -7,10 +7,6 @@ Voice prompts persist until replaced by new voice nouns
 or until user submits a new prompt from the UI prompt box.
 Cache resets on every prompt change for clean transitions.
 
-Forces StreamDiffusion into text-only generation mode via
-input_mode parameter, so prompts control output fully
-even with video input selected in UI.
-
 Author: Krista Faist
 """
 
@@ -30,6 +26,41 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
+
+
+def _find_mic_device():
+    """Auto-detect best microphone device. Prefers Intel Smart Sound, then
+    NVIDIA Broadcast, then system default. Returns (device_id, sample_rate)."""
+    try:
+        import sounddevice as sd
+        devices = sd.query_devices()
+        preferred = [
+            ("Intel", 48000),
+            ("NVIDIA Broadcast", 48000),
+            ("Realtek", 44100),
+        ]
+        for keyword, rate in preferred:
+            for i, d in enumerate(devices):
+                if d['max_input_channels'] > 0 and keyword.lower() in d['name'].lower():
+                    # Find the WASAPI version (48kHz) if available
+                    if abs(d['default_samplerate'] - rate) < 100:
+                        logger.info(f"AUDIO-PLUGIN: auto-detected mic [{i}] {d['name']} @ {rate}Hz")
+                        return i, rate
+            # Second pass: accept any sample rate for this keyword
+            for i, d in enumerate(devices):
+                if d['max_input_channels'] > 0 and keyword.lower() in d['name'].lower():
+                    r = int(d['default_samplerate'])
+                    logger.info(f"AUDIO-PLUGIN: auto-detected mic [{i}] {d['name']} @ {r}Hz")
+                    return i, r
+        # Fallback to system default
+        default_id = sd.default.device[0]
+        if default_id is not None and default_id >= 0:
+            r = int(devices[default_id]['default_samplerate'])
+            logger.info(f"AUDIO-PLUGIN: using default mic [{default_id}] {devices[default_id]['name']} @ {r}Hz")
+            return default_id, r
+    except Exception as e:
+        logger.error(f"AUDIO-PLUGIN: mic detection failed: {e}")
+    return None, 48000
 
 
 class AudioTranscriptionPipeline(Pipeline):
@@ -57,11 +88,16 @@ class AudioTranscriptionPipeline(Pipeline):
         self._last_injected = ""
         self._last_inject_time = 0.0
         self._last_ui_prompt = ""
-        self._ui_prompt_initialized = False  # First UI prompt is just startup, don't clear voice
+        self._ui_prompt_initialized = False
 
         # Timing - process audio every 5 seconds
         self._last_process_time = 0.0
         self._process_interval = 5.0
+
+        # Track whether we just flushed (skip video output for 1 frame after flush)
+        self._flush_pending = False
+        # Double-flush: count down frames to keep sending reset_cache
+        self._flush_frames_remaining = 0
 
         self._whisper_model = None
         self._nlp = None
@@ -97,8 +133,12 @@ class AudioTranscriptionPipeline(Pipeline):
             logger.error(f"AUDIO-PLUGIN: sounddevice error: {e}")
             return
 
-        # Record at native 48000Hz (Intel Smart Sound), resample to 16kHz for Whisper
-        self._native_rate = 48000
+        # Auto-detect mic device
+        mic_device, self._native_rate = _find_mic_device()
+        if mic_device is None:
+            logger.error("AUDIO-PLUGIN: no microphone found")
+            return
+
         chunk_samples = int(self._native_rate * 3.0)
         self._audio_buffer = np.zeros(chunk_samples, dtype=np.int16)
         self._buffer_index = 0
@@ -126,17 +166,17 @@ class AudioTranscriptionPipeline(Pipeline):
                 self._audio_buffer[:] = 0
 
         try:
-            # Use Intel Smart Sound mic (device 27 @ 48000Hz) - louder pickup
-            mic_device = 27
             logger.info(f"AUDIO-PLUGIN: opening mic device {mic_device} at {self._native_rate}Hz")
-            self._stream = sd.InputStream(samplerate=self._native_rate, channels=1, callback=_cb, blocksize=1024, device=mic_device)
+            self._stream = sd.InputStream(
+                samplerate=self._native_rate, channels=1, callback=_cb,
+                blocksize=1024, device=mic_device,
+            )
             self._stream.start()
-            logger.info("AUDIO-PLUGIN: mic capture started on Intel Smart Sound")
+            logger.info("AUDIO-PLUGIN: mic capture started")
         except Exception as e:
             logger.error(f"AUDIO-PLUGIN: mic start failed: {e}")
 
     def prepare(self, **kwargs) -> Requirements:
-        # Only request video if video mode is active
         if kwargs.get("video") is not None:
             return Requirements(input_size=1)
         return None
@@ -145,44 +185,62 @@ class AudioTranscriptionPipeline(Pipeline):
         video_input = kwargs.get("video")
         output = {}
 
-        # Pass video through for our own output queue (preprocessor must output video)
-        if video_input is not None:
+        # Pass video through (preprocessor must output video)
+        # BUT skip video on flush frames so downstream doesn't queue stale frames
+        if video_input is not None and not self._flush_pending:
             frame = video_input[0] if isinstance(video_input, list) else video_input
             if frame.dim() == 4:
                 frame = frame.squeeze(0)
             frames = frame.unsqueeze(0).to(device=self.device, dtype=torch.float32) / 255.0
             output["video"] = frames.clamp(0, 1)
+        elif video_input is not None and self._flush_pending:
+            # Still need to output video (preprocessor requirement) but mark for flush
+            frame = video_input[0] if isinstance(video_input, list) else video_input
+            if frame.dim() == 4:
+                frame = frame.squeeze(0)
+            frames = frame.unsqueeze(0).to(device=self.device, dtype=torch.float32) / 255.0
+            output["video"] = frames.clamp(0, 1)
+            self._flush_pending = False
 
-        # Tell downstream StreamDiffusion to ignore video and use text-only mode
-        # pipeline_processor bypass sets _video_mode=False directly
+        # Tell downstream to use text-only mode
         output["input_mode"] = "text"
 
-        # Slow down to match downstream consumption (~1fps)
-        time.sleep(0.3)
+        # Throttle preprocessor to ~1fps to match downstream StreamDiffusion actual throughput
+        # StreamDiffusion runs at 0.5-1fps — anything faster just floods the output queue
+        time.sleep(1.0)
 
-        # Check if user submitted a new UI prompt (overrides voice)
+        # Double-flush: keep sending reset_cache for a few frames after prompt change
+        # to catch any stale frames that snuck into the queue
+        if self._flush_frames_remaining > 0:
+            self._flush_frames_remaining -= 1
+            output["reset_cache"] = True
+
+        # --- UI PROMPT BOX: check if user typed a new prompt ---
         ui_prompts = kwargs.get("prompts")
         if ui_prompts and isinstance(ui_prompts, list) and len(ui_prompts) > 0:
             ui_text = ui_prompts[0].get("text", "") if isinstance(ui_prompts[0], dict) else str(ui_prompts[0])
             if ui_text:
                 if not self._ui_prompt_initialized:
-                    # First time seeing a UI prompt — just record it, don't clear voice
                     self._last_ui_prompt = ui_text
                     self._ui_prompt_initialized = True
                     logger.info(f"AUDIO-PLUGIN: initial UI prompt recorded: '{ui_text}'")
                 elif ui_text != self._last_ui_prompt:
-                    # User actually changed the prompt — clear voice, use theirs
+                    # User hit enter with new text — flush everything, inject immediately
                     logger.info(f"AUDIO-PLUGIN: UI prompt changed to '{ui_text}', clearing voice")
                     self._last_ui_prompt = ui_text
                     self._last_injected = ""
+                    self._flush_pending = True
+                    self._flush_frames_remaining = 3
+                    output["prompts"] = [{"text": ui_text, "weight": 100.0}]
                     output["reset_cache"] = True
+                    logger.info(f"AUDIO-PLUGIN: >>> FLUSH + INJECT (text box): '{ui_text}'")
                     return output
 
-        # Keep injecting last voice prompt indefinitely until replaced
+        # Keep injecting last voice prompt every frame until replaced
         if self._last_injected:
             output["prompts"] = [{"text": self._last_injected, "weight": 100.0}]
 
-        # Only process audio every N seconds
+        # --- VOICE: only process audio every N seconds ---
         now = time.monotonic()
         if now - self._last_process_time < self._process_interval:
             return output
@@ -200,7 +258,7 @@ class AudioTranscriptionPipeline(Pipeline):
 
         logger.info("AUDIO-PLUGIN: transcribing...")
         audio_float = audio.astype(np.float32) / 32768.0
-        # Resample from native rate (48000) to 16000 for Whisper
+        # Resample from native rate to 16kHz for Whisper
         if self._native_rate != self.sample_rate:
             ratio = self.sample_rate / self._native_rate
             new_len = int(len(audio_float) * ratio)
@@ -220,41 +278,38 @@ class AudioTranscriptionPipeline(Pipeline):
         if not text or len(text) < 3:
             return output
 
-        # Extract concrete/compound nouns only — skip filler speech
+        # Extract concrete/compound nouns — skip filler speech
         nouns = []
         if self._nlp:
             doc = self._nlp(text)
-            # Get compound nouns (adjective+noun phrases) and standalone nouns
             for chunk in doc.noun_chunks:
-                # Filter out pronouns and determiners-only chunks
                 has_noun = any(t.pos_ in ("NOUN", "PROPN") for t in chunk)
                 if has_noun:
                     nouns.append(chunk.text.strip())
-            # Fallback: grab individual nouns if no chunks found
             if not nouns:
                 nouns = [t.text for t in doc if t.pos_ in ("NOUN", "PROPN")]
             logger.info(f"AUDIO-PLUGIN: nouns extracted: {nouns}")
         else:
-            # No spaCy — pass through raw text
             nouns = [text]
 
         if not nouns:
             logger.info(f"AUDIO-PLUGIN: no nouns found in '{text}', skipping")
             return output
 
-        # Build prompt from nouns only
         noun_prompt = ", ".join(nouns)
 
         # Skip duplicates
         if noun_prompt == self._last_injected:
             return output
 
-        # New voice prompt — inject with cache reset for clean transition
+        # New voice nouns — flush everything and inject immediately
         self._last_injected = noun_prompt
         self._last_inject_time = time.monotonic()
+        self._flush_pending = True
+        self._flush_frames_remaining = 3
         output["prompts"] = [{"text": noun_prompt, "weight": 100.0}]
         output["reset_cache"] = True
-        logger.info(f"AUDIO-PLUGIN: >>> NEW PROMPT: '{noun_prompt}' (from: '{text}')")
+        logger.info(f"AUDIO-PLUGIN: >>> FLUSH + INJECT (voice): '{noun_prompt}' (from: '{text}')")
         return output
 
     def __del__(self):

@@ -22,6 +22,19 @@ LOG_PATH = os.path.expandvars(
     r"%APPDATA%\Daydream Scope\logs\main.log"
 )
 
+# Patterns — matches BOTH old and new log formats
+RE_NEW_PROMPT = re.compile(
+    r"AUDIO-PLUGIN: >>> (?:FLUSH \+ INJECT|NEW PROMPT)\s*\(?(\w[\w\s]*?)?\)?:\s*'(.+?)'"
+)
+RE_EXPIRED = re.compile(r"AUDIO-PLUGIN: voice prompt expired")
+RE_NOUNS = re.compile(r"AUDIO-PLUGIN: nouns extracted: (.+)")
+RE_NO_NOUNS = re.compile(r"AUDIO-PLUGIN: no nouns found in '(.+?)'")
+RE_AMPLITUDE = re.compile(r"AUDIO-PLUGIN: audio amplitude=(\d+\.\d+)")
+RE_UI_CHANGED = re.compile(r"AUDIO-PLUGIN: UI prompt changed to '(.+?)'")
+RE_UI_INITIAL = re.compile(r"AUDIO-PLUGIN: initial UI prompt recorded: '(.+?)'")
+RE_TRANSCRIPTION = re.compile(r"AUDIO-PLUGIN: result='(.+?)'")
+RE_TRANSCRIBING = re.compile(r"AUDIO-PLUGIN: transcribing")
+
 
 class PromptMonitor:
     def __init__(self):
@@ -34,7 +47,7 @@ class PromptMonitor:
         self.root.overrideredirect(False)
 
         # Status label (voice / UI / info)
-        self.status_var = tk.StringVar(value="waiting for voice...")
+        self.status_var = tk.StringVar(value="starting up...")
         self.status_label = tk.Label(
             self.root,
             textvariable=self.status_var,
@@ -46,7 +59,7 @@ class PromptMonitor:
         self.status_label.pack(fill="x", padx=10, pady=(6, 0))
 
         # Main prompt display
-        self.prompt_var = tk.StringVar(value="(no prompt yet)")
+        self.prompt_var = tk.StringVar(value="(scanning log...)")
         self.prompt_label = tk.Label(
             self.root,
             textvariable=self.prompt_var,
@@ -82,28 +95,62 @@ class PromptMonitor:
         self._running = False
         self.root.destroy()
 
-    def _tail_log(self):
-        """Tail the log file for prompt changes."""
-        # Patterns — matches BOTH old and new log formats
-        # New format: AUDIO-PLUGIN: >>> NEW PROMPT (voice): 'freddy krueger'
-        # Old format: AUDIO-PLUGIN: >>> NEW PROMPT: 'freddy krueger'
-        re_new_prompt = re.compile(
-            r"AUDIO-PLUGIN: >>> NEW PROMPT\s*\(?(\w[\w\s]*?)?\)?:\s*'(.+?)'"
-        )
-        re_expired = re.compile(r"AUDIO-PLUGIN: voice prompt expired")
-        re_nouns = re.compile(r"AUDIO-PLUGIN: nouns extracted: (.+)")
-        re_no_nouns = re.compile(r"AUDIO-PLUGIN: no nouns found in '(.+?)'")
-        re_amplitude = re.compile(r"AUDIO-PLUGIN: audio amplitude=(\d+\.\d+)")
-        re_ui_changed = re.compile(r"AUDIO-PLUGIN: UI prompt changed to '(.+?)'")
-        re_transcription = re.compile(r"AUDIO-PLUGIN: result='(.+?)'")
-        re_transcribing = re.compile(r"AUDIO-PLUGIN: transcribing")
+    def _scan_last_prompt(self, filepath):
+        """Read the log file backwards to find the most recent prompt state."""
+        try:
+            with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+                # Scan entire log backwards — queue spam can bury prompt lines thousands of lines back
+                tail = lines
+        except (FileNotFoundError, PermissionError):
+            return
 
-        # Seek to end of file
+        # Walk backwards to find the most recent prompt-setting line
+        for line in reversed(tail):
+            if "AUDIO-PLUGIN" not in line:
+                continue
+
+            m = RE_NEW_PROMPT.search(line)
+            if m:
+                source = (m.group(1) or "").strip().lower()
+                prompt = m.group(2)
+                if "voice" in source:
+                    self._update_status("🎤 VOICE (recovered)")
+                    self.prompt_label.configure(fg="#00ff88")
+                elif "ui" in source:
+                    self._update_status("📝 UI PROMPT (recovered)")
+                    self.prompt_label.configure(fg="#ffdd00")
+                else:
+                    self._update_status(f"PROMPT (recovered)")
+                    self.prompt_label.configure(fg="#00d4ff")
+                self._update_prompt(prompt)
+                return
+
+            m = RE_UI_CHANGED.search(line)
+            if m:
+                self._update_status("📝 UI PROMPT (recovered)")
+                self._update_prompt(m.group(1))
+                self.prompt_label.configure(fg="#ffdd00")
+                return
+
+            m = RE_UI_INITIAL.search(line)
+            if m:
+                self._update_status("📝 UI PROMPT (startup)")
+                self._update_prompt(m.group(1))
+                self.prompt_label.configure(fg="#ffdd00")
+                return
+
+    def _tail_log(self):
+        """Scan for last known prompt, then tail the log for changes."""
+        # First: recover current state from existing log
+        self._scan_last_prompt(LOG_PATH)
+
+        # Now open and seek to end for live tailing
         try:
             f = open(LOG_PATH, "r", encoding="utf-8", errors="replace")
             f.seek(0, 2)  # end of file
         except FileNotFoundError:
-            self._update_status("log file not found")
+            self._update_status("⚠ log file not found")
             self._update_prompt(LOG_PATH)
             return
 
@@ -113,24 +160,23 @@ class PromptMonitor:
                 time.sleep(0.3)
                 continue
 
-            # Only process AUDIO-PLUGIN lines
             if "AUDIO-PLUGIN" not in line:
                 continue
 
             # New prompt injected (voice, UI, or fallback)
-            m = re_new_prompt.search(line)
+            m = RE_NEW_PROMPT.search(line)
             if m:
                 source = m.group(1) or "unknown"
                 prompt = m.group(2)
                 source_lower = source.strip().lower()
                 if "voice" in source_lower:
-                    self._update_status("VOICE")
+                    self._update_status("🎤 VOICE")
                     self._flash("#00ff88")
                 elif "ui fallback" in source_lower:
-                    self._update_status("FALLBACK (voice timed out)")
+                    self._update_status("🔶 FALLBACK (voice timed out)")
                     self._flash("#ff8800")
                 elif "ui" in source_lower:
-                    self._update_status("UI PROMPT")
+                    self._update_status("📝 UI PROMPT")
                     self._flash("#ffdd00")
                 else:
                     self._update_status(f"PROMPT ({source})")
@@ -138,53 +184,61 @@ class PromptMonitor:
                 self._update_prompt(prompt)
                 continue
 
-            # UI prompt changed (debounced acceptance)
-            m = re_ui_changed.search(line)
+            # UI prompt changed
+            m = RE_UI_CHANGED.search(line)
             if m:
-                self._update_status("UI PROMPT")
+                self._update_status("📝 UI PROMPT")
                 self._update_prompt(m.group(1))
                 self._flash("#ffdd00")
                 continue
 
+            # Initial UI prompt on startup
+            m = RE_UI_INITIAL.search(line)
+            if m:
+                self._update_status("📝 UI PROMPT (startup)")
+                self._update_prompt(m.group(1))
+                self.prompt_label.configure(fg="#ffdd00")
+                continue
+
             # Voice expired
-            if re_expired.search(line):
-                self._update_status("FALLBACK (voice timed out)")
+            if RE_EXPIRED.search(line):
+                self._update_status("🔶 FALLBACK (voice timed out)")
                 self._update_prompt("(reverted to prompt box)")
                 self._flash("#ff8800")
                 continue
 
             # Transcribing indicator
-            if re_transcribing.search(line):
-                self._update_detail("transcribing...")
+            if RE_TRANSCRIBING.search(line):
+                self._update_detail("🔄 transcribing...")
                 continue
 
             # Transcription result
-            m = re_transcription.search(line)
+            m = RE_TRANSCRIPTION.search(line)
             if m:
                 text = m.group(1)
                 if text:
-                    self._update_detail(f"heard: \"{text}\"")
+                    self._update_detail(f'heard: "{text}"')
                 continue
 
             # No nouns found
-            m = re_no_nouns.search(line)
+            m = RE_NO_NOUNS.search(line)
             if m:
-                self._update_status(f"skipped: \"{m.group(1)}\" (no nouns)")
+                self._update_detail(f'🔇 skipped: "{m.group(1)}" (no nouns)')
                 continue
 
             # Nouns extracted
-            m = re_nouns.search(line)
+            m = RE_NOUNS.search(line)
             if m:
-                self._update_detail(f"nouns: {m.group(1)}")
+                self._update_detail(f"🔍 nouns: {m.group(1)}")
                 continue
 
             # Amplitude
-            m = re_amplitude.search(line)
+            m = RE_AMPLITUDE.search(line)
             if m:
                 amp = float(m.group(1))
                 bar_len = min(int(amp * 50), 20)
-                bar = "|" * bar_len
-                self._update_detail(f"amp: {amp:.4f} {bar}")
+                bar = "█" * bar_len + "░" * (20 - bar_len)
+                self._update_detail(f"📊 amp: {amp:.4f} {bar}")
                 continue
 
         f.close()
